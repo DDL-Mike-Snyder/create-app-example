@@ -137,4 +137,4 @@ app.css.append_css({
 })
 
 if __name__ == '__main__':
-    app.run_server(host='0.0.0.0', port=8888)  # Domino hosts all apps at 0.0.0.0:8888
+    app.run(host='0.0.0.0', port=8888)  # Domino hosts all apps at 0.0.0.0:8888
