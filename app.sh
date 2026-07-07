@@ -1,2 +1,2 @@
-pip install -r requirements_apps.txt --user
+pip install -r requirements_app.txt --user
 python app-dash.py
