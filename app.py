@@ -31,11 +31,11 @@ if uploaded_file is not None:
                 response = requests.post(
                     model_api_url,
                     json={"data": {"image_base64": base64.b64encode(image_bytes).decode("utf-8")}},
-                    headers={"Authorization": f"Bearer {model_api_token}"},
+                    auth=(model_api_token, model_api_token),
                     timeout=30,
                 )
                 response.raise_for_status()
-                result = response.json()["result"]
+                result = response.json()
 
                 st.metric("Predicted digit", result["digit"])
                 st.progress(result["confidence"])
