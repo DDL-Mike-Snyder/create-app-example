@@ -1,8 +1,22 @@
 # Handwritten Digit Recognizer on Domino — reference guide
 
 End-to-end demo: a user uploads a JPG/PNG of a handwritten digit to a Streamlit app,
-the app calls a Domino Model API running a scikit-learn classifier, and the app
-displays the uploaded image, the predicted digit, and the confidence.
+which predicts the digit and confidence using a scikit-learn classifier registered in
+the Domino Model Registry. The app displays the uploaded image, the predicted digit,
+and the confidence.
+
+## Current status
+
+| Piece | Status |
+|---|---|
+| Training + registration (`train.py`, run as a Job) | **Done.** Model registered as `mnist-digit-classifier`, alias `champion` points to the latest version (~95% test accuracy). |
+| Model API (`model.py`) | **Written and correct, but not deployed.** This Domino deployment's Model API build service (buildkit) is currently stuck ("Leasing buildkit worker" never completes) — confirmed platform-level, reproduced on two separate build attempts, unrelated to this project's code. Needs whoever administers this Domino deployment to look at the build service. |
+| App (`app.py`) | **Working**, using a temporary architecture change: it loads the registered model **in-process** via `mlflow.sklearn.load_model(...)` instead of calling a Model API over HTTP, since Apps launch from an already-built environment image and don't need buildkit. Not yet published. |
+
+**To switch back to a real Model API once buildkit is fixed:** publish `model.py`
+(unchanged, already correct — see Stage 2), then revert `app.py` to call it over HTTP
+instead of loading the model in-process (the original HTTP-calling version is in git
+history prior to the in-process-inference commit).
 
 ---
 
@@ -11,15 +25,13 @@ displays the uploaded image, the predicted digit, and the confidence.
 | File | Role |
 |---|---|
 | `train.py` | Trains the classifier on MNIST and registers it in the Domino Model Registry (MLflow). Run as a Domino Job. |
-| `model.py` | Domino Model API: `init()` loads the registered model, `predict()` decodes an uploaded image and returns `{digit, confidence}`. Published separately as a Model API. |
-| `app.py` | Streamlit app: upload UI, calls the Model API over HTTP, displays image/prediction/confidence. Published as a Domino App. |
+| `model.py` | Domino Model API function: `predict()` decodes an uploaded image and returns `{digit, confidence}`. Ready to publish once the build service is back; not currently deployed. |
+| `app.py` | Streamlit app: upload UI, loads the registered model directly and predicts in-process, displays image/prediction/confidence. |
 | `app.sh` | Launch command Domino runs for the App — starts Streamlit on `0.0.0.0:8888`. |
-| `requirements_app.txt` | Packages the App needs (`streamlit`, `pillow`, `requests`). |
+| `requirements_app.txt` | Packages the App needs: `streamlit`, `pillow`, `mlflow`, `scikit-learn`, `numpy`. |
 
-These are three independently deployed Domino artifacts (Job, Model API, App) that get
-wired together via one shared piece of state: the registered model name/alias
-(`mnist-digit-classifier@champion`), and two environment variables the App uses to call
-the Model API (`MODEL_API_URL`, `MODEL_API_TOKEN`).
+The shared piece of state linking training to serving is the registered model
+name/alias: `models:/mnist-digit-classifier@champion`.
 
 ---
 
@@ -36,60 +48,72 @@ the Model API (`MODEL_API_URL`, `MODEL_API_TOKEN`).
   and registers the model with `mlflow.sklearn.log_model(..., registered_model_name=
   "mnist-digit-classifier")`.
 - Sets the new version's alias to `champion` via
-  `MlflowClient.set_registered_model_alias` — this is what `model.py` loads
-  (`models:/mnist-digit-classifier@champion`). Re-running `train.py` registers a new
-  version and moves the alias forward automatically.
+  `MlflowClient.set_registered_model_alias` — this is what both `model.py` and `app.py`
+  load (`models:/mnist-digit-classifier@champion`). Re-running `train.py` registers a
+  new version and moves the alias forward automatically.
 
-**Run it:** as a Domino Job — `python train.py` — rather than only interactively in a
-Workspace, so the run is tied to a `DOMINO_RUN_ID`.
+**Run it:** as a Domino Job (`domino.job_start(command="train.py", ...)` via the
+`dominodatalab` SDK, or the UI) rather than only interactively in a Workspace, so the
+run is tied to a `DOMINO_RUN_ID`. Pin `environment_id`/`hardware_tier_id` explicitly to
+a known-good combo (this project uses the default "Domino Standard Environment" on
+`small-k8s`) — leaving them unset falls back to whatever this project's execution
+defaults happen to be, which may point at a different, unverified environment/tier.
 
-**Verify:** check the project's Experiments/Registry UI for the new run and model
-version, then in a Workspace: `mlflow.sklearn.load_model("models:/mnist-digit-classifier@champion")`
-and run `predict_proba` on a few held-out samples. Confirmed locally: test accuracy
-≈95.1%, and a second run correctly loaded the cached `.npz` instead of re-fetching.
+**Verified:** ran end-to-end as Job #11 — cached-dataset load confirmed (no re-fetch on
+second run), test accuracy 95.13%, registered version 3, aliased `champion`.
 
 ---
 
-## Stage 2 — Publish the Model API
+## Stage 2 — Publish the Model API (blocked on platform build service)
 
 1. In the Domino UI: **Publish → Model APIs → New Model API**.
 2. Point it at `model.py`, function `predict`.
 3. Make sure the Model API's environment includes `scikit-learn`, `mlflow`, `numpy`,
-   `pillow` (either baked into the compute environment or via the Model API's own
-   requirements file).
+   `pillow`.
 4. Publish, wait for status **Running**, then copy the endpoint URL and the
-   auto-generated access token from the Model API page — these become `MODEL_API_URL`
-   / `MODEL_API_TOKEN` for the App in Stage 3.
+   auto-generated access token from the Model API page.
 
-**Request/response contract:**
+**Important — `init()` is not a real lifecycle hook.** Domino's classic Model API
+harness only calls the configured function (`predict`) per request; it does **not**
+call any separate startup/init function. `model.py` loads the model lazily on first
+`predict()` call and caches it in a module-level global — do not rely on a separate
+`init()` being called automatically (an earlier version of this file did, and every
+request failed with `'NoneType' object has no attribute 'predict'` until fixed).
+
+**Request/response contract (confirmed from a live test before the build outage):**
 ```
-POST {MODEL_API_URL}
-Authorization: Bearer {MODEL_API_TOKEN}
+POST {url}                                    # e.g. https://<domino-host>/models/{model_id}/latest/model
+auth: (access_token, access_token)            # HTTP basic auth, token as both user and password
 Content-Type: application/json
 
 {"data": {"image_base64": "<base64-encoded JPG/PNG bytes>"}}
 ```
-Response: `{"result": {"digit": 7, "confidence": 0.94}, ...}`
+Response is the `predict()` return value directly at the top level — **not** wrapped
+in a `{"result": ...}` envelope: `{"digit": 7, "confidence": 0.94}`.
 
-**Verify before wiring the app:**
+**Known platform issue:** publishing a new Model API version (`model_version_publish`)
+got stuck at "Leasing buildkit worker" in the build logs on two separate attempts
+(versions 2 and 3), even after canceling and retrying. This is a build-service-level
+problem in this Domino deployment, not specific to this project's code — flag it to
+whoever administers this Domino instance if it recurs.
+
+**Verify before wiring the app** (once the build service is healthy):
 - Use the Model API's built-in **Test** tab with a hand-crafted `image_base64` payload.
-- Or script it: base64-encode a real image file and POST it with `requests`, checking
-  both a valid image and a bad/non-image payload.
-- Locally confirmed: `model.py`'s `init()`/`predict()` correctly classify synthetic
-  "photo-style" digits (inverted MNIST samples simulating dark ink on light paper) with
-  8/8 correct and confidences 0.84–1.00.
+- Script it: base64-encode a real image file and POST it with `requests`, checking both
+  a valid image and a bad/non-image payload.
 
 ---
 
-## Stage 3 — Publish the App
+## Stage 3 — The App (currently in-process, no Model API dependency)
 
-`app.py` is a small Streamlit app: `st.file_uploader` → `st.image` to display the
-upload → POST to the Model API → `st.metric`/`st.progress` for the digit and
-confidence. Errors from the Model API show a plain "Couldn't reach the prediction
-service — try again" message rather than a raw traceback.
+`app.py` loads the registered model directly (`mlflow.sklearn.load_model`, cached via
+`st.cache_resource`) and runs the same grayscale → invert → resize(28x28) → normalize
+→ `predict`/`predict_proba` pipeline that `model.py` would run in a Model API. This
+avoids the buildkit outage entirely, since Apps launch from an already-built
+environment image and only run `pip install` + `streamlit run` at startup — no new
+container build required.
 
-`app.sh` starts Streamlit directly (no separate pip step needed beyond what's already
-there):
+`app.sh`:
 ```bash
 streamlit run app.py \
     --server.port 8888 --server.address 0.0.0.0 --server.headless true \
@@ -97,30 +121,35 @@ streamlit run app.py \
     --browser.gatherUsageStats false
 ```
 `enableCORS`/`enableXsrfProtection` are disabled specifically to avoid WebSocket errors
-behind Domino's reverse proxy. Unlike the previous Dash version of this app, Streamlit
-needs **no** `DOMINO_RUN_HOST_PATH`/base-path handling — Domino's proxy strips the
-prefix before forwarding, and Streamlit works fine at root path.
+behind Domino's reverse proxy. Streamlit needs **no** `DOMINO_RUN_HOST_PATH`/base-path
+handling — Domino's proxy strips the prefix before forwarding.
 
-1. In **Project Settings → Environment Variables** (or the App's own environment
-   variable settings), set `MODEL_API_URL` and `MODEL_API_TOKEN` from Stage 2.
-2. Confirm locally / in a Workspace first: `bash app.sh`, open the preview, upload a
-   real handwritten-digit photo, confirm image + prediction + confidence render.
-   Confirmed locally: the app boots cleanly and serves HTTP 200.
-3. Publish via **Publish → App** (title, hardware tier, permissions, Publish).
-4. Smoke-test the published URL: page loads without a stuck "Please wait..." (would
+**Verified locally:** boots cleanly (HTTP 200), and the full image→prediction pipeline
+was validated against the live registered model on real (simulated-photo) inputs:
+4/5 correct with confidences 0.65–1.0 on a random sample (the one miss, 8 predicted as
+9, is a plausible model confusion, not a pipeline bug).
+
+**To publish:**
+1. Publish via **Publish → App** (title, hardware tier, permissions, Publish).
+2. Smoke-test the published URL: page loads without a stuck "Please wait..." (would
    indicate a WebSocket failure), upload a fresh image, confirm end-to-end result, check
    **View Logs** on any failure.
-5. `st.session_state` is per-browser-session — re-test with two tabs uploading
-   different images concurrently to confirm no cross-user state bleed.
+3. `st.session_state` and `st.cache_resource` are process-wide/per-session, not
+   cross-request-mutable — re-test with two tabs uploading different images
+   concurrently to confirm no cross-user state bleed.
 
 ---
 
 ## Known limitations / follow-ups
 
-- The Model API's preprocessing (grayscale → invert → resize to 28x28) assumes a
-  roughly centered, single digit on a plain background. If real-world accuracy is
-  disappointing on off-center or oddly-cropped photos, the next improvement is
-  MNIST-style centering: threshold the image, crop to the digit's bounding box, and
-  re-center it in the 28x28 canvas before flattening.
+- The preprocessing (grayscale → invert → resize to 28x28) assumes a roughly centered,
+  single digit on a plain background. If real-world accuracy is disappointing on
+  off-center or oddly-cropped photos, the next improvement is MNIST-style centering:
+  threshold the image, crop to the digit's bounding box, and re-center it in the 28x28
+  canvas before flattening.
 - `TRAIN_SAMPLE_SIZE` in `train.py` trades training speed for accuracy — raise it (up
   to the full ~70k rows) if a Job's runtime budget allows.
+- Once the Model API build service is fixed, consider moving back to the Model
+  API + HTTP call architecture (`model.py` is ready) to decouple inference scaling
+  from the App's own process, and to get Domino's built-in Model API monitoring
+  (Grafana dashboards, request logging) for free.

@@ -1,14 +1,27 @@
 """Streamlit app: upload a handwritten digit image, get a prediction + confidence.
 
-Calls a Domino Model API (see model.py) for inference. Requires MODEL_API_URL and
-MODEL_API_TOKEN to be set as project/app environment variables.
+Loads the registered MLflow model directly in-process rather than calling a separate
+Model API. Domino's Model API build service (buildkit) is currently down in this
+deployment, which blocks building any new Model API container; Apps don't need a
+buildkit build (they launch from an already-built environment image), so this sidesteps
+the outage. See DIGIT-APP-PLAN.md for how to switch back to a real Model API once the
+platform issue is resolved -- model.py already has the equivalent predict() logic.
 """
 
-import base64
-import os
+import io
 
-import requests
+import mlflow
+import numpy as np
 import streamlit as st
+from PIL import Image, ImageOps
+
+MODEL_URI = "models:/mnist-digit-classifier@champion"
+
+
+@st.cache_resource
+def load_model():
+    return mlflow.sklearn.load_model(MODEL_URI)
+
 
 st.set_page_config(page_title="Digit Recognizer", page_icon="🔢")
 st.title("Handwritten Digit Recognizer")
@@ -20,25 +33,20 @@ if uploaded_file is not None:
     image_bytes = uploaded_file.getvalue()
     st.image(image_bytes, caption="Uploaded image", width=200)
 
-    model_api_url = os.environ.get("MODEL_API_URL")
-    model_api_token = os.environ.get("MODEL_API_TOKEN")
+    with st.spinner("Predicting..."):
+        try:
+            model = load_model()
 
-    if not model_api_url or not model_api_token:
-        st.error("MODEL_API_URL and MODEL_API_TOKEN must be set as environment variables.")
-    else:
-        with st.spinner("Predicting..."):
-            try:
-                response = requests.post(
-                    model_api_url,
-                    json={"data": {"image_base64": base64.b64encode(image_bytes).decode("utf-8")}},
-                    auth=(model_api_token, model_api_token),
-                    timeout=30,
-                )
-                response.raise_for_status()
-                result = response.json()
+            img = Image.open(io.BytesIO(image_bytes)).convert("L")  # grayscale
+            img = ImageOps.invert(img)  # MNIST: light digit on dark bg; photos are usually the opposite
+            img = img.resize((28, 28))
 
-                st.metric("Predicted digit", result["digit"])
-                st.progress(result["confidence"])
-                st.write(f"Confidence: {result['confidence']:.1%}")
-            except Exception:
-                st.error("Couldn't reach the prediction service — try again.")
+            pixels = np.array(img, dtype=np.float32).reshape(1, -1) / 255.0
+            prediction = int(model.predict(pixels)[0])
+            confidence = float(model.predict_proba(pixels)[0].max())
+
+            st.metric("Predicted digit", prediction)
+            st.progress(confidence)
+            st.write(f"Confidence: {confidence:.1%}")
+        except Exception:
+            st.error("Couldn't generate a prediction — try again.")
